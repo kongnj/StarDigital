@@ -1,0 +1,553 @@
+---
+title: "Marketing Assignment"
+author: "Qingyang Kong"
+date: "2024-11-23"
+output: html_document
+---
+
+```{r}
+## clean memory
+rm(list=ls()) 
+graphics.off()
+```
+
+```{r}
+# load libraries
+library(mfx)
+library(sandwich)
+library(lmtest)
+library(tidyverse)
+library(magrittr)
+library(fastDummies)
+library(ddml)
+library(AER)
+library(ranger)
+library(xgboost)
+library(pdp)
+library(ggplot2)
+```
+
+```{r}
+data <- read.csv("star_digital.csv")
+data.all <- data #save a copy of original data
+data <- data %>% rowwise() %>% mutate(tot_impressions = sum(imp_1, imp_2, imp_3,imp_4,imp_5,imp_6))
+head(data)
+#Since the sample is random, so we assume there is no Selection Bias and Omitted Variable Bias
+```
+
+```{r}
+#check missing value
+any(is.na(data))
+#check negative value, all number should be >=0
+any(data < 0)
+#review the data
+table(data$purchase) #balanced
+table(data$test)
+table(data[data$test == 0,]$purchase)
+table(data[data$test == 1,]$purchase)
+#for test = 0, less purchase than not purchase. For test = 1, slightly more purchase than not purchase
+```
+
+```{r}
+#Check distribution/ frequency of impressions across test groups
+# Summarize total impressions for each channel by Assignment
+impressions_summary <- data %>%
+  group_by(test) %>%
+  summarise(
+    total_imp_1 = sum(imp_1, na.rm = TRUE),
+    total_imp_2 = sum(imp_2, na.rm = TRUE),
+    total_imp_3 = sum(imp_3, na.rm = TRUE),
+    total_imp_4 = sum(imp_4, na.rm = TRUE),
+    total_imp_5 = sum(imp_5, na.rm = TRUE),
+    total_imp_6 = sum(imp_6, na.rm = TRUE),
+    total_imp = sum(tot_impressions, na.rm = TRUE)
+  )
+
+# View the summary table
+print(impressions_summary)
+```
+
+```{r}
+# Calculate the proportion for each channel within each Assignment group
+impressions_proportions <- impressions_summary %>%
+  mutate(
+    proportion_imp_1 = total_imp_1 / total_imp,
+    proportion_imp_2 = total_imp_2 / total_imp,
+    proportion_imp_3 = total_imp_3 / total_imp,
+    proportion_imp_4 = total_imp_4 / total_imp,
+    proportion_imp_5 = total_imp_5 / total_imp,
+    proportion_imp_6 = total_imp_6 / total_imp
+  ) %>% dplyr::select(test, 
+               proportion_imp_1, proportion_imp_2, proportion_imp_3, 
+               proportion_imp_4, proportion_imp_5, proportion_imp_6)
+
+# View the final summary table with proportions
+print(impressions_proportions)  # Quite not balanced impression serving.
+```
+
+```{r}
+#check correlations
+test_data <- data %>% filter(test == 1)
+control_data <- data %>% filter(test == 0)
+cor.table <- test_data %>%  dplyr::select(imp_1,imp_2,imp_3,imp_4,imp_5,imp_6)
+cor(cor.table) #There is no strongly correlated
+cor.table <- control_data %>%  dplyr::select(imp_1,imp_2,imp_3,imp_4,imp_5,imp_6)
+cor(cor.table) #There is no strongly correlated
+```
+
+```{r}
+t.test(data$tot_impressions ~ data$test)
+#The results indicate the average impressions for both test and control are similar and they are not significantly different from each other.
+```
+
+```{r}
+par(mfrow = c(1, 2), oma = c(0, 0, 2, 0))
+hist(test_data$tot_impressions, xlab = 'Total Impressions', main = "Treatment")
+hist(control_data$tot_impressions, xlab = 'Total Impressions', main = "Control")
+mtext("Distributions of Overall Impressions", outer = TRUE, cex = 1.5)
+```
+
+```{r for Q1}
+#check the purchase rate for test = 1 and test =0
+sum <- table(data$test)
+sum(test_data$purchase)/sum[2] #0.5048792 
+sum(control_data$purchase)/sum[1] #0.4856928 
+
+# In test group, the purchase rate is slightly higher
+```
+
+```{r for Q1}
+# check the effect of whether the customer is in a control group or test group
+# Naive ATE
+eff1 <- lm(purchase ~ test, data= data)
+AIC(eff1) #36731.07
+summary(eff1)
+eff2 <- glm(purchase ~ test, data= data, family=binomial(link="logit")) #0.07676 positive effect
+summary(eff2) #AIC: 35077
+#We select eff2:
+#P = 0.0614, This result was statistically significant with an assumed confidence interval of 90%， This suggests that while there is a slight increase in purchase rate due to online advertising, it is not strong enough to be deemed conclusive evidence of effectiveness at 5% level.
+exp(coef(eff2)[2]) #1.079783
+#We find compare to control group, the possibility of the test group to make a purchase increase by 7.9783%
+```
+
+```{r or Q1}
+#XGB models
+# Prepare the data
+
+y <- data.all$purchase  # Target variable
+X <- data.all[, c("test", "imp_1", "imp_2", "imp_3", "imp_4", "imp_5", "imp_6")]  # Features
+# Convert data to matrix format for xgboost
+X_matrix <- as.matrix(X)
+y_vector <- as.numeric(y)
+ntree.var <- 500
+
+# Define XGBoost parameters
+params <- list(
+  objective = "reg:squarederror",  # Regression task (for predicting sales)
+  colsample_bytree = 0.8,  # Subsample features at each tree (similar to mtry in random forest)
+  max_depth = 4,           # Max depth of each tree
+  eta = 0.2,               # Learning rate
+  subsample = 0.8          # Row subsampling (randomly sampled data)
+)
+set.seed(42) 
+
+# Train the XGBoost model
+xgb_model <- xgboost(data = X_matrix, label = y_vector, params = params, 
+                     nrounds = ntree.var, verbose = 0)  # nrounds is equivalent to ntree in random forest
+```
+
+```{r}
+# List of channels to compute AMEs for
+channels <- colnames(X)
+ame_results_xgb <- list()  # Initialize an empty list to store AME results
+
+# Loop over each channel to calculate the AME
+for (channel in channels) {
+  # Compute partial dependence for each channel
+  partial_xgb <- pdp::partial(xgb_model, pred.var = channel, train = as.data.frame(X), 
+                              grid.resolution = 25, plot = FALSE)
+  
+  # Plot partial dependence
+  print(pdp::plotPartial(partial_xgb))
+  
+  # Calculate numerical derivative (difference in yhat over difference in channel values)
+  delta_xgb <- diff(partial_xgb$yhat) / diff(partial_xgb[[channel]])
+  
+  # Calculate the average marginal effect for the channel
+  average_marginal_effect <- mean(delta_xgb, na.rm = TRUE)
+  
+  # Store the AME result in the list
+  ame_results_xgb[[channel]] <- average_marginal_effect
+}
+
+# Convert results to a named vector for easier viewing
+ame_results_xgb <- unlist(ame_results_xgb)
+print(ame_results_xgb)  # Display AME for each channel
+```
+
+```{r for Q1}
+features <- c("test", "imp_1", "imp_2", "imp_3", "imp_4", "imp_5", "imp_6")
+importance_matrix <- xgb.importance(model = xgb_model, feature_names = features)
+importance_df <- as.data.frame(importance_matrix)
+print(importance_df)
+#test feature importance：
+#Gain is 0.01185603	
+#Cover and Frequency are 0.03864357	and 0.03525377，it shows the test variable was not widely used in decision-making splits within the model and did not have a significant impact overall.In conclusion, the results from the XGBoost model indicate that online advertising for Star Digital had a limited effect on driving purchases. 
+```
+
+```{r for Q2}
+model_freq <- lm(purchase ~ test*tot_impressions,data = data)
+summary(model_freq)
+coeftest(model_freq, vcov. = vcovHC)
+AIC(model_freq) #36145.36
+```
+
+```{r for Q2}
+model_freq <- lm(purchase ~ test*log(tot_impressions),data = data)
+summary(model_freq)
+coeftest(model_freq, vcov. = vcovHC)
+AIC(model_freq) #35162.28
+```
+
+```{r for Q2}
+model_freq_log <- glm(purchase ~ test*tot_impressions,family="binomial" ,data = data)
+summary(model_freq_log)
+coeftest(model_freq_log, vcov. = vcovHC)
+#AIC 33493
+```
+
+```{r for Q2}
+model_freq_log <- glm(purchase ~ test*log(tot_impressions),family="binomial" ,data = data)
+summary(model_freq_log)
+coeftest(model_freq_log, vcov. = vcovHC)
+# from test:log(tot_impressions)，An increase in advertising frequency significantly increases the probability of purchase; however, the difference in impact between the test group and the control group is relatively weak, with p=0.05876 (close to significance).
+#AIC 33493
+```
+
+```{r for Q2}
+lpm.all <- lm(purchase ~ test*(imp_1 + imp_2 + imp_3 + imp_4 + imp_5 + imp_6), data = data)
+coeftest(lpm.all, vcov. = vcovHC)
+AIC(lpm.all) #35730.96
+#AIC too big
+```
+
+
+
+```{r for Q2}
+lpm.all2 <- lm(purchase ~test*(log(imp_1+1) + log(imp_2+1) + log(imp_3+1) + log(imp_4+1) + log(imp_5+1) + log(imp_6+1)), data = data)
+summary(lpm.all2)   
+coeftest(lpm.all2, vcov. = vcovHC)
+AIC(lpm.all2) #33637.63
+#AIC too big
+```
+
+```{r for Q2}
+glm.all <- glm(purchase ~ test*(imp_1 + imp_2 + imp_3 + imp_4 + imp_5 + imp_6), data = data)
+summary(glm.all)   # AIC: 35731
+coeftest(glm.all, vcov. = vcovHC)
+#AIC too big
+```
+
+```{r for Q2}
+glm.all2 <- glm(purchase ~ test*(log(imp_1+1) + log(imp_2+1) + log(imp_3+1) + log(imp_4+1) + log(imp_5+1) + log(imp_6+1)),family = 'binomial', data = data)
+summary(glm.all2)   # AIC: 31390
+coeftest(glm.all2, vcov. = vcovHC)
+#it is signification for some test:impression
+#imp_3 positive, largest and significant
+#imp_5 negative, and significant.
+# some channel has positive effect on purchase but some are negative
+```
+
+```{r}
+#We run logitmfx for model with better fit
+mfx.logit.log <- logitmfx(purchase ~ test*(log(imp_1+1) + log(imp_2+1) + log(imp_3+1) + log(imp_4+1) + log(imp_5+1) + log(imp_6+1)), data = data,atmean = FALSE)
+print(mfx.logit.log) # Reminder: These are not robust standard errors
+mfx.logit.log <- logitmfx(purchase ~ test*(log(imp_1+1) + log(imp_2+1) + log(imp_3+1) + log(imp_4+1) + log(imp_5+1) + log(imp_6+1)), data = data,atmean = TRUE)
+print(mfx.logit.log)
+```
+
+```{r for Q3}
+data$sum1to5 <- data$imp_1 + data$imp_2 + data$imp_3 + data$imp_4 + data$imp_5
+glm.all3= glm(purchase ~ test*(sum1to5 + imp_6), data = data, family = 'binomial')
+summary(glm.all3)
+coeftest(glm.all3, vcov. = vcovHC)
+exp(coef(glm.all3)) #AIC 34178
+#all significant at confidence interval of 95%
+#test:sum1to5 has a higher coef and lower P value
+```
+
+```{r for Q3}
+glm.all3= glm(purchase ~ test*(log(sum1to5+1) + log(imp_6+1)), data = data, family = 'binomial')
+summary(glm.all3)
+coeftest(glm.all3, vcov. = vcovHC)
+exp(coef(glm.all3)) #AIC 33321
+#test:sum1to5 has a higher coef and lower P value
+```
+
+```{r for Q3}
+data$cost_1to5 <- data$sum1to5*(25/1000)
+data$cost_6 <- data$imp_6*(20/1000)
+summary(data$cost_1to5)
+summary(data$cost_6)
+```
+
+```{r}
+model_1to5_6 = glm(purchase ~ test*(log(cost_1to5+1)+log(cost_6+1)),family="binomial" ,data = data)
+summary(model_1to5_6)
+coeftest(model_1to5_6, vcov. = vcovHC)
+#test:log(cost_6 + 1)  is slightly higher
+#test:log(cost_6 + 1)  not significant enough
+```
+
+```{r for Q3 using ROI}
+# Calculate conversion rates
+conversion_rate_1to5 <- exp(coef(glm.all3)[5])-1
+conversion_rate_6 <- exp(coef(glm.all3)[6])-1
+
+# Calculate cost per purchase
+cost_per_purchase_1to5 <- (25 / 1000)/ conversion_rate_1to5
+cost_per_purchase_6 <- (20 / 1000) / conversion_rate_6
+
+# Calculate ROI
+lifetime_value <- 1200  # Lifetime value of a purchase
+roi_1to5 <- (lifetime_value - cost_per_purchase_1to5) / cost_per_purchase_1to5
+roi_6 <- (lifetime_value - cost_per_purchase_6) / cost_per_purchase_6
+
+# Print ROI
+print(paste("ROI for Sites 1-5:", roi_1to5))
+print(paste("ROI for Site 6:", roi_6))
+
+#Roi of Imp 6 is slightly higher
+```
+
+
+```{r for Q4}
+# only consider purely ad observation data, no charity ad.
+obdata <- data.all
+head(obdata)
+```
+
+```{r for Q4}
+### Saturated LPM model -> Only dummy variables for ad treatments
+# Create binary treatment variables
+obdata$t1 <- ifelse(obdata$imp_1 > 0, 1, 0)
+obdata$t2 <- ifelse(obdata$imp_2 > 0, 1, 0)
+obdata$t3 <- ifelse(obdata$imp_3 > 0, 1, 0)
+obdata$t4 <- ifelse(obdata$imp_4 > 0, 1, 0)
+obdata$t5 <- ifelse(obdata$imp_5 > 0, 1, 0)
+obdata$t6 <- ifelse(obdata$imp_6 > 0, 1, 0)
+lpm.sat<- lm(purchase ~ t1 + t2 + t3 + t4 + t5 + t6, data = obdata)
+summary(lpm.sat)   # Adjusted R-squared:  0.03624 
+## Using robust standard errors because of heteroskedasticity
+coeftest(lpm.sat , vcov. = vcovHC)
+
+#imp 2 and imp4 has a positive and significant result
+```
+
+```{r} 
+# check how many website each customer visit
+obdata <- obdata %>% rowwise() %>% mutate(tsum = sum(t1,t2,t3,t4,t5,t6))
+summary(obdata$tsum)
+```
+
+```{r}
+#so we look into imp_2 and imp_4
+mean.obs.imp_2 <- mean(obdata$imp_2) 
+mean.obs.imp_4<- mean(obdata$imp_4) 
+# mean with zero
+print("Effect per ad unit:")
+print(lpm.sat$coefficients["t2"] / mean.obs.imp_2)  ## Marginal effect:  0.00956
+
+# mean with zero
+print("Effect per ad unit:")
+print(lpm.sat$coefficients["t4"] / mean.obs.imp_4)  ## Marginal effect:  0.316897
+#imp_4 is better
+```
+
+```{r for Q4}
+lmob <- lm(purchase ~ imp_1 + imp_2 + imp_3 + imp_4 + imp_5 + imp_6,data = obdata)
+summary(lmob)
+coeftest(lmob, vcov. = vcovHC)
+AIC(lmob) #35731.19
+```
+
+```{r for Q4}
+lmob <- lm(purchase ~ log(imp_1+1) + log(imp_2+1) + log(imp_3+1) + log(imp_4+1) + log(imp_5+1) + log(imp_6+1),data = obdata)
+summary(lmob)
+coeftest(lmob, vcov. = vcovHC)
+AIC(lmob) #33632.35
+```
+
+```{r for Q4}
+glmob <- glm(purchase ~ imp_1 + imp_2 + imp_3 + imp_4 + imp_5 + imp_6,data = obdata)
+summary(glmob)
+coeftest(glmob, vcov. = vcovHC)
+#AIC: 35731 too big
+```
+
+```{r for Q4}
+glmob <- glm(purchase ~ log(imp_1+1) + log(imp_2+1) + log(imp_3+1) + log(imp_4+1) + log(imp_5+1) + log(imp_6+1),family = 'binomial', data = obdata)
+summary(glmob)
+coeftest(glmob, vcov. = vcovHC)
+#AIC: 31389
+#imp 2, imp4, imp6 has a positive and significant results
+```
+
+```{r for Q4}
+## We run logitmfx for model with better fit
+mfx.logit.log <- logitmfx(purchase ~ log(imp_1+1) + log(imp_2+1) + log(imp_3+1) + log(imp_4+1) + log(imp_5+1) + log(imp_6+1),data = obdata)
+print(mfx.logit.log)
+#imp_2, 4 and 6 are positive and significant
+```
+
+```{r for Q4}
+##### Proceed with MEM/AME
+## a)
+mem.logit <- logitmfx(formula = purchase ~ log(imp_1+1) + log(imp_2+1) + log(imp_3+1) + log(imp_4+1) + log(imp_5+1) + log(imp_6+1), data =obdata, atmean = TRUE)
+print(mem.logit)  
+# imp_2: 0.0324233 *** 
+# imp_4: 0.3519577 ***
+# imp_6: 0.0226588 ***
+
+## b)
+ame.logit <- logitmfx(formula = purchase ~ log(imp_1+1) + log(imp_2+1) + log(imp_3+1) + log(imp_4+1) + log(imp_5+1) + log(imp_6+1), data =obdata, atmean = FALSE)
+print(ame.logit)   
+# imp_2: 0.0285404 *** 
+# imp_4: 0.3098081 ***
+# imp_6: 0.0199452 ***
+```
+
+```{r for Q4}
+#consider the price
+obdata$cost1 <- obdata$imp_1*(25/1000)
+obdata$cost2 <- obdata$imp_2*(25/1000)
+obdata$cost3 <- obdata$imp_3*(25/1000)
+obdata$cost4 <- obdata$imp_4*(25/1000)
+obdata$cost5 <- obdata$imp_5*(25/1000)
+obdata$cost6 <- obdata$imp_6*(20/1000)
+model_cost = glm(purchase ~ log(cost1+1)+log(cost2+1)+log(cost3+1)+log(cost4+1)+log(cost5+1)+log(cost6+1),family="binomial" ,data = obdata)
+summary(model_cost)
+coeftest(model_cost, vcov. = vcovHC)
+#imp 2, 4 and 6 get positive and significant results but imp 4 is the largest
+```
+
+```{r for Q4}
+##### Proceed with MEM/AME
+## a)
+mem.logit.log <- logitmfx(formula = purchase ~ log(cost1+1) + log(cost2+1) + log(cost3+1) + log(cost4+1) + log(cost5+1) + log(cost6+1), data =obdata, atmean = TRUE)
+print(mem.logit.log)  
+# imp_2: 0.266581 *** 
+# imp_4: 2.576511 ***
+# imp_6: 0.324224 ***
+
+## b)
+ame.logit.log <- logitmfx(formula = purchase ~ log(cost1+1) + log(cost2+1) + log(cost3+1) + log(cost4+1) + log(cost5+1) + log(cost6+1), data =obdata, atmean = FALSE)
+print(ame.logit.log)   
+# imp_2: 0.247488 *** 
+# imp_4: 2.391976 ***
+# imp_6: 0.301002 ***
+#imp 2, 4 and 6 get positive and significant results but imp 4 is the largest
+```
+
+```{r}
+#use xgboost
+# Prepare the data
+# Assuming 'data' is your dataset and you're predicting 'sales'
+y <- obdata$purchase  # Target variable
+X <- obdata[, c("cost1", "cost2", "cost3", "cost4", "cost5", "cost6")]  # Features
+
+
+# Convert data to matrix format for xgboost
+X_matrix <- as.matrix(X)
+y_vector <- as.numeric(y)
+
+# number of trees
+ntree.var <- 500
+
+# Define XGBoost parameters
+params <- list(
+  objective = "reg:squarederror",  # Regression task (for predicting sales)
+  colsample_bytree = 0.8,  # Subsample features at each tree (similar to mtry in random forest)
+  max_depth = 4,           # Max depth of each tree
+  eta = 0.2,               # Learning rate
+  subsample = 0.8          # Row subsampling (randomly sampled data)
+)
+
+# set seed
+set.seed(42) 
+
+# Train the XGBoost model
+xgb_model <- xgboost(data = X_matrix, label = y_vector, params = params, 
+                     nrounds = ntree.var, verbose = 0)  # nrounds is equivalent to ntree in random forest
+
+# List of channels to compute AMEs for
+channels <- colnames(X)
+ame_results_xgb <- list()  # Initialize an empty list to store AME results
+
+# Loop over each channel to calculate the AME
+for (channel in channels) {
+  # Compute partial dependence for each channel
+  partial_xgb <- pdp::partial(xgb_model, pred.var = channel, train = as.data.frame(X), 
+                              grid.resolution = 25, plot = FALSE)
+  
+  # Plot partial dependence
+  print(pdp::plotPartial(partial_xgb))
+  
+  # Calculate numerical derivative (difference in yhat over difference in channel values)
+  delta_xgb <- diff(partial_xgb$yhat) / diff(partial_xgb[[channel]])
+  
+  # Calculate the average marginal effect for the channel
+  average_marginal_effect <- mean(delta_xgb, na.rm = TRUE)
+  
+  # Store the AME result in the list
+  ame_results_xgb[[channel]] <- average_marginal_effect
+}
+
+# Convert results to a named vector for easier viewing
+ame_results_xgb <- unlist(ame_results_xgb)
+print(ame_results_xgb)  # Display AME for each channel
+#imp_4 is the best
+```
+
+```{r}
+#use random forest
+# Number of variables randomly sampled at each split
+mtry.var <- 4
+
+# Train a regression random forest model using ranger
+rf_model <- ranger(purchase ~  cost1 + cost2 + cost3 + cost4 + cost5 + cost6, 
+                   data = obdata, 
+                   num.trees = ntree.var,      # Number of trees
+                   mtry = mtry.var,            # Number of variables randomly sampled at each split
+                   importance = "none",        # No variable importance calculation
+                   probability = FALSE)        # Explicitly use regression forest
+
+
+# List of channels to compute AMEs for
+channels <- colnames(X)  # X should be a data frame with selected feature columns
+ame_results_rf <- list()  # Initialize an empty list to store AME results for Random Forest
+
+# Loop over each channel to calculate the AME
+for (channel in channels) {
+  # Compute partial dependence for each channel with the RF model
+  partial_rf <- pdp::partial(rf_model, pred.var = channel, train = as.data.frame(X), 
+                             grid.resolution = 25, plot = FALSE)
+  
+  # Plot partial dependence
+  print(pdp::plotPartial(partial_rf))
+  
+  # Calculate numerical derivative (difference in yhat over difference in channel values)
+  delta_rf <- diff(partial_rf$yhat) / diff(partial_rf[[channel]])
+  
+  # Calculate the average marginal effect for the channel
+  average_marginal_effect_rf <- mean(delta_rf, na.rm = TRUE)
+  
+  # Store the AME result in the list with "_RF" suffix
+  ame_results_rf[[paste0(channel, "_RF")]] <- average_marginal_effect_rf
+}
+
+# Convert results to a named vector for easier viewing
+ame_results_rf <- unlist(ame_results_rf)
+print(ame_results_rf)  # Display AME for each channel
+#imp_4 is the best
+```
